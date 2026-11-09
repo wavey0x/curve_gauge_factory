@@ -83,8 +83,9 @@ event SetGaugeManager:
     _gauge_manager: address
 
 
-event RewardInvalidated:
-    token: indexed(address)
+event SetRewardInvalidated:
+    reward: indexed(address)
+    invalidated: bool
 
 
 event Transfer:
@@ -120,6 +121,9 @@ WEEK: constant(uint256) = 604800
 # - `withdraw()` supports a custom `_receiver`
 # - EIP-712 domain typehash is aligned with the salted domain separator
 # - `decimals()` now returns `uint8` and `version()` is `@pure`
+# - reward deposits are capped at 2**96 to rule out accounting overflow
+# - `claim_rewards()` takes optional `_tokens` to claim only selected reward tokens
+# - `set_reward_invalidated()` excludes a reward token from claims without `_tokens`
 VERSION: constant(String[8]) = "v6.1.1"
 
 EIP712_TYPEHASH: constant(bytes32) = keccak256(
@@ -168,7 +172,7 @@ inflation_params: uint256
 # For tracking external rewards
 reward_count: public(uint256)
 reward_data: public(HashMap[address, Reward])
-invalidated_reward: public(HashMap[address, bool])
+invalidated_reward: public(HashMap[address, bool])  # skipped when claiming without `_tokens`
 reward_remaining: public(HashMap[address, uint256])  # fixes bad precision
 
 # claimant -> default reward receiver
@@ -321,9 +325,17 @@ def _checkpoint(addr: address):
 
 
 @internal
-def _checkpoint_rewards(_user: address, _total_supply: uint256, _claim: bool, _receiver: address):
+def _checkpoint_rewards(
+    _user: address,
+    _total_supply: uint256,
+    _claim: bool,
+    _receiver: address,
+    _tokens: DynArray[address, MAX_REWARDS] = [],
+):
     """
     @notice Claim pending rewards and checkpoint rewards for a user
+    @param _tokens Reward tokens to transfer when claiming, empty for all except invalidated.
+        Rewards that are not transferred stay pending in `claim_data`.
     """
 
     user_balance: uint256 = 0
@@ -341,8 +353,6 @@ def _checkpoint_rewards(_user: address, _total_supply: uint256, _claim: bool, _r
         if i == reward_count:
             break
         token: address = self.reward_tokens[i]
-        if self.invalidated_reward[token]:
-            continue
 
         integral: uint256 = self.reward_data[token].integral
         period_finish: uint256 = self.reward_data[token].period_finish
@@ -375,7 +385,9 @@ def _checkpoint_rewards(_user: address, _total_supply: uint256, _claim: bool, _r
             total_claimable: uint256 = (claim_data >> 128) + new_claimable
             if total_claimable > 0:
                 total_claimed: uint256 = claim_data % 2**128
-                if _claim:
+                if _claim and (
+                    token in _tokens or (len(_tokens) == 0 and not self.invalidated_reward[token])
+                ):
                     assert ERC20(token).transfer(
                         receiver, total_claimable, default_return_value=True
                     )
@@ -503,17 +515,24 @@ def withdraw(_value: uint256, _claim_rewards: bool = False, _receiver: address =
 
 @external
 @nonreentrant("lock")
-def claim_rewards(_addr: address = msg.sender, _receiver: address = empty(address)):
+def claim_rewards(
+    _addr: address = msg.sender,
+    _receiver: address = empty(address),
+    _tokens: DynArray[address, MAX_REWARDS] = [],
+):
     """
     @notice Claim available reward tokens for `_addr`
+    @dev Rewards of tokens that are not claimed stay claimable later
     @param _addr Address to claim for
     @param _receiver Address to transfer rewards to - if set to
                      empty(address), uses the default reward receiver
                      for the caller
+    @param _tokens Reward tokens to claim, including invalidated ones;
+                   empty to claim all except invalidated
     """
     if _receiver != empty(address):
         assert _addr == msg.sender  # dev: cannot redirect when claiming for another user
-    self._checkpoint_rewards(_addr, self.totalSupply, True, _receiver)
+    self._checkpoint_rewards(_addr, self.totalSupply, True, _receiver, _tokens)
 
 
 @external
@@ -707,16 +726,6 @@ def kick(addr: address):
 
 
 @external
-def invalidate_reward(_reward_token: address):
-    assert msg.sender == self.factory.owner()  # dev: only factory admin
-    assert self.reward_data[_reward_token].distributor != empty(address)
-    assert not self.invalidated_reward[_reward_token]
-
-    self.invalidated_reward[_reward_token] = True
-    log RewardInvalidated(_reward_token)
-
-
-@external
 def set_gauge_manager(_gauge_manager: address):
     """
     @notice Change the gauge manager for a gauge
@@ -741,7 +750,6 @@ def deposit_reward_token(_reward_token: address, _amount: uint256, _epoch: uint2
     @param _epoch The duration the rewards are distributed across. Between 3 days and a year, week by default
     """
     assert msg.sender == self.reward_data[_reward_token].distributor
-    assert not self.invalidated_reward[_reward_token]
     assert 3 * WEEK / 7 <= _epoch and _epoch <= WEEK * 4 * 12, "Epoch duration"
 
     self._checkpoint_rewards(empty(address), self.totalSupply, False, empty(address))
@@ -824,6 +832,23 @@ def set_reward_distributor(_reward_token: address, _distributor: address):
 
 
 @external
+def set_reward_invalidated(_reward_token: address, _invalidated: bool):
+    """
+    @notice Exclude a reward token from claims that do not list tokens explicitly
+    @dev Use when the token's `transfer` reverts, so that `claim_rewards()` and
+        `deposit`/`withdraw` with `_claim_rewards=True` keep working for the other
+        rewards. Rewards keep accruing and stay claimable via `claim_rewards(_tokens)`.
+    @param _reward_token The reward token to (un)invalidate
+    @param _invalidated True to skip the token by default, False to restore it
+    """
+    assert msg.sender in [self.manager, self.factory.owner()]  # dev: only manager or factory admin
+    assert self.reward_data[_reward_token].distributor != empty(address)  # dev: not a reward
+
+    self.invalidated_reward[_reward_token] = _invalidated
+    log SetRewardInvalidated(_reward_token, _invalidated)
+
+
+@external
 def set_killed(_is_killed: bool):
     """
     @notice Set the killed status for this contract
@@ -861,8 +886,6 @@ def claimable_reward(_user: address, _reward_token: address) -> uint256:
     @param _reward_token Token to get reward amount for
     @return uint256 Claimable reward token amount
     """
-    if self.invalidated_reward[_reward_token]:
-        return 0
     integral: uint256 = self.reward_data[_reward_token].integral
     total_supply: uint256 = self.totalSupply
     if total_supply != 0:

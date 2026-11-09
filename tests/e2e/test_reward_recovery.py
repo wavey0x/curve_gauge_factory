@@ -9,6 +9,7 @@ GAUGE_CONTROLLER = "0x2F50D538606Fa9EDD2B11E2446BEb18C9D5846bB"
 VEBOOST_PROXY = "0x8E0c00ed546602fD9927DF742bbAbF726D5B0d16"
 VOTING_ESCROW = "0x5f3b5DfEb7B28CDbD7FAba78963EE202a494e2A2"
 WEEK = 604800
+DEAD_ADDRESS = "0x000000000000000000000000000000000000dEaD"
 
 
 @pytest.fixture
@@ -135,54 +136,185 @@ def test_reward_amount_cap(reward_gauge, owner, manager, alice):
     assert lp.balanceOf(alice) == 1
 
 
-def test_invalidating_bad_reward_unblocks_withdrawal(
-    reward_gauge, owner, manager, alice, bob
-):
+def _fund_rewards(gauge, manager, tokens, amount):
+    with boa.env.prank(manager):
+        for token in tokens:
+            gauge.add_reward(token.address, manager)
+            token.mint(manager, amount)
+            token.approve(gauge.address, amount)
+            gauge.deposit_reward_token(token.address, amount)
+
+
+def test_claim_selected_rewards(reward_gauge, manager, alice):
     gauge, lp, bad, good = reward_gauge
     lp.mint(alice, 100)
     with boa.env.prank(alice):
         lp.approve(gauge.address, 100)
         gauge.deposit(100)
-    with boa.env.prank(manager):
-        for token in (bad, good):
-            gauge.add_reward(token.address, manager)
-            token.mint(manager, WEEK)
-            token.approve(gauge.address, WEEK)
-            gauge.deposit_reward_token(token.address, WEEK)
+    _fund_rewards(gauge, manager, (bad, good), WEEK)
 
     boa.env.time_travel(seconds=100)
     bad.set_fail_transfer(True)
     with boa.env.prank(alice), boa.reverts():
         gauge.withdraw(10, True)
-    assert gauge.balanceOf(alice) == 100
+    with boa.env.prank(alice), boa.reverts():
+        gauge.claim_rewards()
+
+    # exit without claiming is never blocked by a reward token
+    with boa.env.prank(alice):
+        gauge.withdraw(10, False)
+    assert lp.balanceOf(alice) == 10
 
     bad.set_fail_transfer(False)
     bad.set_burn_gas(True)
-    calldata = keccak(text="withdraw(uint256,bool,address)")[:4] + encode(
-        ["uint256", "bool", "address"], [10, True, alice]
+    calldata = keccak(text="claim_rewards(address,address)")[:4] + encode(
+        ["address", "address"], [alice, alice]
     )
     with pytest.raises(Revert):
         boa.env.raw_call(gauge.address, sender=alice, gas=1_000_000, data=calldata)
 
-    with boa.env.prank(bob), boa.reverts():
-        gauge.invalidate_reward(bad.address)
-    with boa.env.prank(owner):
-        gauge.invalidate_reward(bad.address)
-    assert gauge.invalidated_reward(bad.address)
-    assert gauge.claimable_reward(alice, bad.address) == 0
-
+    pending = gauge.claimable_reward(alice, bad.address)
+    assert pending > 0
+    calldata = keccak(text="claim_rewards(address,address,address[])")[:4] + encode(
+        ["address", "address", "address[]"], [alice, alice, [good.address]]
+    )
     boa.env.raw_call(gauge.address, sender=alice, gas=1_000_000, data=calldata)
-    with boa.env.prank(alice):
-        gauge.claim_rewards()
-    assert gauge.balanceOf(alice) == 90
-    assert lp.balanceOf(alice) == 10
-    assert bad.balanceOf(alice) == 0
     assert good.balanceOf(alice) > 0
+    assert bad.balanceOf(alice) == 0
+    assert gauge.claimable_reward(alice, bad.address) == pending
 
+    # broken token can still be stopped by moving its distributor
     with boa.env.prank(manager):
+        gauge.set_reward_distributor(bad.address, DEAD_ADDRESS)
         with boa.reverts():
             gauge.deposit_reward_token(bad.address, 1)
-        gauge.set_reward_distributor(bad.address, bob)
-    assert gauge.invalidated_reward(bad.address)
-    with boa.env.prank(owner), boa.reverts():
-        gauge.invalidate_reward(bad.address)
+
+    bad.set_burn_gas(False)
+    with boa.env.prank(alice):
+        gauge.claim_rewards()
+    assert bad.balanceOf(alice) == pending
+
+
+def test_partial_claim_keeps_other_rewards(reward_gauge, manager, alice):
+    gauge, lp, bad, good = reward_gauge
+    lp.mint(alice, 300)
+    with boa.env.prank(alice):
+        lp.approve(gauge.address, 300)
+        gauge.deposit(100)
+    _fund_rewards(gauge, manager, (bad, good), WEEK * 10)  # rate = 10 / s
+
+    boa.env.time_travel(seconds=1000)
+    bad.set_fail_transfer(True)
+    with boa.env.prank(alice):
+        gauge.claim_rewards(alice, alice, [good.address])
+    assert good.balanceOf(alice) == 10_000
+    assert gauge.claimable_reward(alice, bad.address) == 10_000
+    assert gauge.claimable_reward(alice, good.address) == 0
+
+    # deposit more, withdraw part, sit idle: accrual continues on the new balance
+    boa.env.time_travel(seconds=1000)
+    with boa.env.prank(alice):
+        gauge.deposit(200)
+    boa.env.time_travel(seconds=1000)
+    with boa.env.prank(alice):
+        gauge.withdraw(150, False)
+    boa.env.time_travel(seconds=1000)
+    assert abs(gauge.claimable_reward(alice, good.address) - 30_000) <= 5
+    pending_good = gauge.claimable_reward(alice, good.address)
+    assert gauge.claimable_reward(alice, bad.address) == pending_good + 10_000
+
+    # token fixed: everything accumulated is claimable, nothing lost or double counted
+    bad.set_fail_transfer(False)
+    with boa.env.prank(alice):
+        gauge.claim_rewards()
+    assert bad.balanceOf(alice) == good.balanceOf(alice)
+    assert abs(bad.balanceOf(alice) - 40_000) <= 5
+    assert gauge.claimable_reward(alice, bad.address) == 0
+    assert gauge.claimed_reward(alice, bad.address) == bad.balanceOf(alice)
+
+    # pending accrued before a full withdrawal is still claimable with zero balance
+    boa.env.time_travel(seconds=1000)
+    with boa.env.prank(alice):
+        gauge.withdraw(150, False)
+    assert gauge.balanceOf(alice) == 0
+    pending = gauge.claimable_reward(alice, bad.address)
+    assert abs(pending - 10_000) <= 5 and pending == gauge.claimable_reward(alice, good.address)
+    before = bad.balanceOf(alice)
+    with boa.env.prank(alice):
+        gauge.claim_rewards(alice, alice, [bad.address])
+    assert bad.balanceOf(alice) == before + pending
+    assert gauge.claimable_reward(alice, bad.address) == 0
+    assert gauge.claimable_reward(alice, good.address) == pending
+
+
+def test_invalidated_reward_skipped_by_default(reward_gauge, owner, manager, alice, bob):
+    gauge, lp, bad, good = reward_gauge
+    lp.mint(alice, 100)
+    with boa.env.prank(alice):
+        lp.approve(gauge.address, 100)
+        gauge.deposit(100)
+    _fund_rewards(gauge, manager, (bad, good), WEEK)
+
+    boa.env.time_travel(seconds=100)
+    bad.set_fail_transfer(True)
+    with boa.env.prank(alice), boa.reverts():
+        gauge.withdraw(10, True)
+
+    with boa.env.prank(bob), boa.reverts():
+        gauge.set_reward_invalidated(bad.address, True)
+    with boa.env.prank(manager), boa.reverts():
+        gauge.set_reward_invalidated(lp.address, True)  # not a reward
+    with boa.env.prank(owner):
+        gauge.set_reward_invalidated(bad.address, True)
+
+    # integration flow unchanged: withdraw with claim returns LP and the other rewards
+    with boa.env.prank(alice):
+        gauge.withdraw(10, True)
+    assert lp.balanceOf(alice) == 10
+    assert good.balanceOf(alice) > 0
+    assert bad.balanceOf(alice) == 0
+    pending = gauge.claimable_reward(alice, bad.address)
+    assert pending > 0
+
+    # gas burning token is skipped as well, no external call
+    bad.set_fail_transfer(False)
+    bad.set_burn_gas(True)
+    boa.env.time_travel(seconds=100)
+    calldata = keccak(text="withdraw(uint256,bool,address)")[:4] + encode(
+        ["uint256", "bool", "address"], [10, True, alice]
+    )
+    boa.env.raw_call(gauge.address, sender=alice, gas=1_000_000, data=calldata)
+    assert lp.balanceOf(alice) == 20
+    bad.set_burn_gas(False)
+
+    # explicit claim still transfers the invalidated token
+    pending = gauge.claimable_reward(alice, bad.address)
+    with boa.env.prank(alice):
+        gauge.claim_rewards(alice, alice, [bad.address])
+    assert bad.balanceOf(alice) == pending
+
+    # restore: default claim picks the token up again, accounting kept running
+    boa.env.time_travel(seconds=100)
+    with boa.env.prank(manager):
+        gauge.set_reward_invalidated(bad.address, False)
+    pending = gauge.claimable_reward(alice, bad.address)
+    assert pending > 0
+    with boa.env.prank(alice):
+        gauge.claim_rewards()
+    assert gauge.claimable_reward(alice, bad.address) == 0
+    assert bad.balanceOf(alice) == gauge.claimed_reward(alice, bad.address)
+
+    # accounting keeps running while invalidated, so the distribution can be finished
+    with boa.env.prank(owner):
+        gauge.set_reward_invalidated(bad.address, True)
+    boa.env.time_travel(seconds=WEEK)
+    gauge.recover_remaining(bad.address)
+    assert gauge.reward_remaining(bad.address) == 0
+    pending = gauge.claimable_reward(alice, bad.address)
+    assert pending > 0
+    with boa.env.prank(alice):
+        gauge.claim_rewards()
+    assert gauge.claimable_reward(alice, bad.address) == pending
+    with boa.env.prank(alice):
+        gauge.claim_rewards(alice, alice, [bad.address])
+    assert gauge.claimable_reward(alice, bad.address) == 0
