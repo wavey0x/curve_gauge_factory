@@ -51,6 +51,6 @@ def test_factory_deploys_real_liquidity_gauge(
     assert gauge.lp_token() == lp_token.address
     assert gauge.name() == "Curve.fi LP Gauge Deposit"
     assert gauge.symbol() == "LP-gauge"
-    assert gauge.version() == "v6.1.1"
+    assert gauge.version() == "v6.2.0"
     assert gauge.inflation_rate() == 123456789
     assert gauge.future_epoch_time() == 2_000_000_000

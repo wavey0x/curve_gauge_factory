@@ -5,7 +5,7 @@
 @author Curve Finance
 @license Copyright (c) Curve.Fi, 2020-2026 - all rights reserved
 @notice Implementation contract for use with Curve Factory
-@custom:version 6.1.1
+@custom:version 6.2.0
 """
 from vyper.interfaces import ERC20
 
@@ -121,10 +121,11 @@ WEEK: constant(uint256) = 604800
 # - `withdraw()` supports a custom `_receiver`
 # - EIP-712 domain typehash is aligned with the salted domain separator
 # - `decimals()` now returns `uint8` and `version()` is `@pure`
-# - reward deposits are capped at 2**96 to rule out accounting overflow
+# - reward deposits are capped at 2**96
+# Updated from v6.1.1:
 # - `claim_rewards()` takes optional `_tokens` to claim only selected reward tokens
 # - `set_reward_invalidated()` excludes a reward token from claims without `_tokens`
-VERSION: constant(String[8]) = "v6.1.1"
+VERSION: constant(String[8]) = "v6.2.0"
 
 EIP712_TYPEHASH: constant(bytes32) = keccak256(
     "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)"
